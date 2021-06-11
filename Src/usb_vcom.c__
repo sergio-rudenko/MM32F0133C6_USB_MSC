@@ -1,0 +1,644 @@
+/*
+ * usb_vcom.c
+ *
+ *  Created on: 29 апр. 2021 г.
+ *      Author: sa100
+ *
+ * Description: Virtual COM port (CDC)
+ *
+ */
+
+#include <string.h>
+
+#include "usb_lib.h"
+#include "hal_uid.h"
+
+#include "systick.h"
+
+/* ---[ private macros ]--------------------------------------------------- */
+#define LOBYTE(x)  ((uint8_t)(((x) & 0x00FFU) >> 0U))
+#define HIBYTE(x)  ((uint8_t)(((x) & 0xFF00U) >> 8U))
+
+
+/* ---[ private definitions ]---------------------------------------------- */
+//#define SEND_ENCAPSULATED_COMMAND   		 0x00
+//#define GET_ENCAPSULATED_RESPONSE   		 0x01
+#define SET_COMM_FEATURE            		 0x02
+//#define GET_COMM_FEATURE            		 0x03
+//#define CLEAR_COMM_FEATURE          		 0x04
+#define SET_LINE_CODING             		 0x20
+#define GET_LINE_CODING             		 0x21
+#define SET_CONTROL_LINE_STATE      		 0x22
+//#define SEND_BREAK                  		 0x23
+
+
+/* ---[ private variables ]------------------------------------------------ */
+static uint8_t buf[VIRTUAL_COM_PORT_TO_HOST_BUFFER_SIZE];
+static ONE_DESCRIPTOR descriptor = { buf, 0 };
+static VirtualComPort_t VCP_ =
+  {
+    .State = UNCONNECTED,
+    .LineCoding =
+      {
+        .Config =
+          {
+            .bitrate 		= 19200,
+            .format 		= 0,
+            .parityType 	= 0,
+            .dataBits		= 8,
+          },
+        .pendingUpdate 		= false,
+      },
+  };
+
+
+/* ---[ exported variables ]----------------------------------------------- */
+VirtualComPort_t *pVirtualComPort = &VCP_;
+
+
+/* ---[ external functions ]----------------------------------------------- */
+extern uint32_t HAL_GetTick();
+
+
+/* ---[ functions ]-------------------------------------------------------- */
+
+/**
+ * common powerOn|Reset
+ */
+static void
+initialisation()
+{
+  /* Disable all endpoints */
+  _ClrEP_EN(
+    (1 << ENDP0) |
+    (1 << ENDP1) |
+    (1 << ENDP2) |
+    (1 << ENDP3) |
+    (1 << ENDP4));
+
+  /* Enabler USB EP0 interrupts */
+  _SetEP0_INT_EN(
+    EPn_INT_EN_SETUPIE |
+    EPn_INT_EN_INNACKIE |
+    EPn_INT_EN_OUTACKIE);	//|EPn_INT_EN_OUTNACKIE |EPn_INT_EN_INACKIE
+
+  /* Clear USB EP0 interrupts */
+  _ClrEP0_INT_STA(
+    EPn_INT_STATE_SETUP |
+    EPn_INT_STATE_INACK |
+    EPn_INT_STATE_INNACK |
+    EPn_INT_STATE_OUTACK |
+    EPn_INT_STATE_OUTNACK);
+
+  /* Enabler USB EP1 interrupts */
+  _SetEP1_INT_EN(EPn_INT_EN_INNACKIE);
+  _ClrEP1_INT_STA(EPn_INT_STATE_INNACK);
+
+  /* Enabler USB EP2 interrupts */
+  _SetEP2_INT_EN(EPn_INT_EN_INNACKIE);
+  _ClrEP2_INT_STA(EPn_INT_EN_INNACKIE);
+
+  /* Enabler USB EP3 interrupts */
+  _SetEP3_INT_EN(EPn_INT_EN_OUTACKIE);
+  _ClrEP3_INT_STA(EPn_INT_STATE_OUTACK);
+
+  /* Enable EP0, EP1, EP2 and EP3 */
+  _SetEP_EN(
+    (1 << ENDP0) |
+    (1 << ENDP1) |
+    (1 << ENDP2) |
+    (1 << ENDP3));
+
+  /* Enable EP0, EP1, EP2 interrupts */
+  _SetEP_INT_EN(
+    (1 << ENDP0) |
+    (1 << ENDP1) |
+    (1 << ENDP2) |
+    (1 << ENDP3));
+}
+
+/**
+ * Emulate USB cable connect|disconnect
+ * ( 1.5K internal pull-up resistor )
+ */
+static void
+connect_cable(FunctionalState NewState)
+{
+  if (NewState == ENABLE) {
+    _SetUSB_TOP(USB_TOP_CONNECT);
+  }
+  else {
+    _ClrUSB_TOP(USB_TOP_CONNECT);
+  }
+}
+
+
+/**
+ * Initialization.
+ */
+static void
+init_device()
+{
+  /* for the serial number string descriptor
+   * with the data from the unique ID */
+  GetChipUID();
+
+  /* hardware */
+  USB_HardwareInit();
+
+  pInformation->Current_Configuration = 0;
+
+  connect_cable(DISABLE);	// USB connection 1.5K internal pull-up resistor
+
+  /* USB Reset */
+  _SetUSB_TOP(USB_TOP_RESET);
+  _ClrUSB_TOP(USB_TOP_RESET);
+
+  /* Clear USB interrupts */
+  _ClrUSB_INT_STA(
+    USB_INT_STATE_RSTF |
+    USB_INT_STATE_EPINTF);	// USB_INT_STATE_SOFF|
+
+  /* Enabler USB interrupts */
+  _SetUSB_INT_EN(
+    USB_INT_EN_RSTIE |
+    USB_INT_EN_EPINTIE);	// USB_INT_EN_SOFIE|
+
+  initialisation();
+  ring_buffer_init(&pVirtualComPort->rbToHost, buf, sizeof(buf));
+
+  connect_cable(ENABLE);	// USB connection 1.5K internal pull-up resistor
+
+  /* USB interrupts clear states */
+  _ClrUSB_INT_STA(0xff);
+
+  pVirtualComPort->State = UNCONNECTED;
+}
+
+/**
+ * Reset routine.
+ */
+static void
+reset_device(void)
+{
+  /* Set DEVICE as not configured */
+  pInformation->Current_Configuration = 0;
+
+  /* Current Feature initialization */
+  pInformation->Current_Feature = 0x80;
+
+  /* Set Virtual_Com_Port DEVICE with the default Interface */
+  pInformation->Current_Interface = 0;
+
+  initialisation();
+  SetDeviceAddress(0);
+
+  /* USB Reset */
+  _SetUSB_TOP(USB_TOP_RESET);
+  _ClrUSB_TOP(USB_TOP_RESET);
+
+  ring_buffer_reset(&pVirtualComPort->rbToHost);
+  pVirtualComPort->State = ATTACHED;
+}
+
+/**
+ *  @brief  Update the device state to addressed.
+ *  @param  None.
+ *  @retval None.
+ */
+static void
+process_status_in()
+{
+  pVirtualComPort->State = ADDRESSED;
+}
+
+/**
+ *  @brief  status OUT routine.
+ *  @param  None.
+ *  @retval None.
+ */
+static void
+process_status_out()
+{
+}
+
+/**
+ * @brief  send the linecoding structure to the PC host.
+ * @param  Length
+ * @retval LineCoding structure base address
+ */
+static uint8_t*
+get_lineCoding(u16 Length)
+{
+  if (Length == 0) {
+    pInformation->Ctrl_Info.Usb_wLength = sizeof(USB_VCOM_LineCoding_t);
+    return NULL;
+  }
+  return (uint8_t*) &pVirtualComPort->LineCoding.Config;
+}
+
+/**
+ * @brief  Set the linecoding structure fields.
+ * @param  Length
+ * @retval LineCoding structure base address
+ */
+static uint8_t*
+set_lineCoding(u16 Length)
+{
+  if (Length == 0) {
+    pInformation->Ctrl_Info.Usb_wLength = sizeof(USB_VCOM_LineCoding_t);
+    return NULL;
+  }
+
+  pVirtualComPort->LineCoding.pendingUpdate = true;
+  return (uint8_t*) &pVirtualComPort->LineCoding.Config;
+}
+
+/**
+ *  @brief  Handle the data class specific requests.
+ *  @param  Request No.
+ *  @retval USB_UNSUPPORT or USB_SUCCESS.
+ */
+static RESULT
+setup_data_class(u8 RequestNo)
+{
+  u8* (*CopyRoutine)(u16);
+  CopyRoutine = NULL;
+
+  if (RequestNo == GET_LINE_CODING)
+  {
+    if (Type_Recipient == (CLASS_REQUEST | INTERFACE_RECIPIENT))
+    {
+      CopyRoutine = get_lineCoding;
+    }
+  }
+  else if (RequestNo == SET_LINE_CODING)
+  {
+    if (Type_Recipient == (CLASS_REQUEST | INTERFACE_RECIPIENT))
+    {
+      CopyRoutine = set_lineCoding;
+    }
+  }
+
+  if (CopyRoutine == NULL) {
+    return USB_UNSUPPORT;
+  }
+
+  pInformation->Ctrl_Info.CopyData = CopyRoutine;
+  pInformation->Ctrl_Info.Usb_wOffset = 0;
+  (*CopyRoutine)(0);
+  return USB_SUCCESS;
+}
+
+/**
+ *  @brief  handle the no data class specific requests.
+ *  @param  Request No.
+ *  @retval USB_UNSUPPORT or USB_SUCCESS.
+ */
+static RESULT
+setup_nodata_class(u8 RequestNo)
+{
+  if (Type_Recipient == (CLASS_REQUEST | INTERFACE_RECIPIENT))
+  {
+    if (RequestNo == SET_COMM_FEATURE)
+    {
+      return USB_SUCCESS;
+    }
+    else if (RequestNo == SET_CONTROL_LINE_STATE)
+    {
+      return USB_SUCCESS;
+    }
+  }
+
+  return USB_UNSUPPORT;
+}
+
+/**
+ *  @brief  test the interface and the alternate setting according to the
+ *          supported one.
+ *  @param  u8: Interface : interface number.
+ *          u8: AlternateSetting : Alternate Setting number.
+ *  @retval USB_UNSUPPORT or USB_SUCCESS.
+ */
+static RESULT
+get_interface_settings(u8 Interface, u8 AlternateSetting)
+{
+  if (AlternateSetting > 0)
+  {
+    return USB_UNSUPPORT;
+  }
+  else if (Interface > 1)
+  {
+    return USB_UNSUPPORT;
+  }
+  return USB_SUCCESS;
+}
+
+/**
+ * convert half byte to char
+ */
+static uint8_t
+nibble_to_char(uint8_t halfByte)
+{
+  uint8_t result;
+
+  if (halfByte <= 0x9) {
+    result = '0' + halfByte;
+  }
+  else if (halfByte >= 0xA &&
+           halfByte <= 0xF) {
+    result = 'A' + halfByte - 0xA;
+  }
+  else {
+    result = '-';
+  }
+  return result;
+}
+
+/**
+ *  @brief  Gets the device descriptor.
+ *  @param  Length.
+ *  @retval The address of the device descriptor.
+ */
+static uint8_t*
+get_usb_device_descriptor(uint16_t len)
+{
+  descriptor.Descriptor_Size = USB_DeviceDescriptorSize;
+  memcpy(descriptor.Descriptor, USB_DeviceDescriptor, descriptor.Descriptor_Size);
+
+  return Standard_GetDescriptorData(len, &descriptor);
+}
+
+/**
+ *  @brief  Gets the configuration descriptor.
+ *  @param  Length.
+ *  @retval The address of the configuration descriptor.
+ */
+static uint8_t*
+get_usb_config_descriptor(uint16_t len)
+{
+  descriptor.Descriptor_Size = USB_ConfigDescriptorSize;
+  memcpy(descriptor.Descriptor, USB_ConfigDescriptor, descriptor.Descriptor_Size);
+
+  return Standard_GetDescriptorData(len, &descriptor);
+}
+
+/**
+ *  @brief  Gets the string descriptors according to the needed index.
+ *  @param  Length.
+ *  @retval The address of the string descriptors.
+ */
+static uint8_t*
+get_usb_string_descriptor(uint16_t len)
+{
+  uint8_t index = pInformation->USBwValue0;
+  uint8_t *result;
+
+  switch(index) {
+    case USB_DESC_LANGUAGE_ID_INDEX:
+      descriptor.Descriptor_Size = 2 + USB_LangIdDescriptorSize;
+      memcpy(&descriptor.Descriptor[2], USB_LangIdDescriptor, descriptor.Descriptor_Size);
+      break;
+
+    case USB_DESC_VENDOR_INDEX:
+      descriptor.Descriptor_Size = 2 + USB_VendorDescriptorSize;
+      memcpy(&descriptor.Descriptor[2], USB_VendorDescriptor, descriptor.Descriptor_Size);
+      break;
+
+    case USB_DESC_PRODUCT_INDEX:
+      descriptor.Descriptor_Size = 2 + USB_ProductDescriptorSize;
+      memcpy(&descriptor.Descriptor[2], USB_ProductDescriptor, descriptor.Descriptor_Size);
+      break;
+
+    case USB_DESC_SERIAL_NUMBER_INDEX:
+      memset(&descriptor.Descriptor[0], 0x00, sizeof(buf));
+      descriptor.Descriptor_Size = 2 + sizeof(device_id_data) * 2;
+      for(uint8_t i = 0; i < sizeof(device_id_data); i++) {
+        descriptor.Descriptor[2 + i * 4] = nibble_to_char((device_id_data[i] >> 0) & 0x0F);
+        descriptor.Descriptor[4 + i * 4] = nibble_to_char((device_id_data[i] >> 4) & 0x0F);
+      }
+      break;
+
+    default:
+      result = NULL;
+  }
+
+  if (index < USB_DESC_STRING_COUNT) {
+    descriptor.Descriptor[0] = descriptor.Descriptor_Size; 	/*bLength*/
+    descriptor.Descriptor[1] = USB_DESC_TYPE_STRING; 		/*bDescriptorType*/
+    result = Standard_GetDescriptorData(len, &descriptor);
+  }
+  return result;
+}
+
+
+DEVICE Device_Table =
+  {
+    4, // Number of endpoints that are used
+    1, // Number of configuration available
+  };
+
+DEVICE_PROP Device_Property =
+  {
+    init_device,
+    reset_device,
+    process_status_in,
+    process_status_out,
+    setup_data_class,
+    setup_nodata_class,
+    get_interface_settings,
+    get_usb_device_descriptor,
+    get_usb_config_descriptor,
+    get_usb_string_descriptor,
+    0, 	/* RxEP_buffer */
+    64,	/* max packet size */
+  };
+
+
+/* ------------------------------------------------------------------------ */
+
+/**
+ *
+ */
+void set_configuration()
+{
+  DEVICE_INFO* pInfo = &Device_Info;
+
+  if (pInfo->Current_Configuration != 0) {
+    // Device configured
+    pVirtualComPort->State = CONFIGURED;
+  }
+}
+
+/**
+ *
+ */
+void set_device_address()
+{
+  pVirtualComPort->State = ADDRESSED;
+}
+
+
+USER_STANDARD_REQUESTS User_Standard_Requests =
+  {
+    NOP_Process,
+    set_configuration,
+    NOP_Process,
+    NOP_Process,
+    NOP_Process,
+    NOP_Process,
+    NOP_Process,
+    NOP_Process,
+    set_device_address,
+  };
+
+
+/* ------------------------------------------------------------------------ */
+
+/**
+ *  @brief  EP1 IN (port -> host) Callback.
+ *  @param  None.
+ *  @retval None.
+ */
+void EP1_IN_Callback()
+{
+  uint8_t data[CDC_DATA_FS_MAX_PACKET_SIZE];
+  size_t  size = ring_buffer_available(&pVirtualComPort->rbToHost);
+
+  if (size && ((_GetUSB_CTRL1() & EP1_CTRL_TRANEN ) == 0))
+  {
+    if (size >= CDC_DATA_FS_MAX_PACKET_SIZE) {
+      size = CDC_DATA_FS_MAX_PACKET_SIZE;
+    }
+    ring_buffer_read_bytes(&pVirtualComPort->rbToHost, data, size);
+    UserToPMABufferCopy((uint8_t*)data, ENDP1, size);
+    _SetUSB_CTRL1(EP1_CTRL_TRANEN | size);
+  }
+}
+
+
+void (*pEpInt_IN[7])(void) =
+  {
+    EP1_IN_Callback,
+    NOP_Process,
+    NOP_Process,
+    NOP_Process,
+    NOP_Process,
+    NOP_Process,
+    NOP_Process,
+  };
+
+
+/* ------------------------------------------------------------------------ */
+
+/**
+ *  @brief  EP3 OUT (host -> port) Callback.
+ *  @param  None.
+ *  @retval None.
+ */
+void EP3_OUT_Callback()
+{
+  uint8_t data[CDC_DATA_FS_MAX_PACKET_SIZE + 1/* NOTE: \0 */] = {0};
+  size_t  size = _GetUSB_AVILn(ENDP3);
+
+  if (size > CDC_DATA_FS_MAX_PACKET_SIZE) {
+    size %= CDC_DATA_FS_MAX_PACKET_SIZE;
+  }
+  PMAToUserBufferCopy(data, ENDP3, size);
+  VCOM_onDataReceivedFromHost(data, size);
+}
+
+
+void (*pEpInt_OUT[7])(void) =
+  {
+    NOP_Process,
+    NOP_Process,
+    EP3_OUT_Callback,
+    NOP_Process,
+    NOP_Process,
+    NOP_Process,
+    NOP_Process,
+  };
+
+
+/* ------------------------------------------------------------------------ */
+
+/**
+ * Interrupt Handler
+ */
+void USB_IRQHandler()
+{
+  if(_GetUSB_INT_STA() & USB_INT_STATE_SOFF)
+  {
+    _ClrUSB_INT_STA(USB_INT_STATE_SOFF);
+    /* TODO? 1ms callback */
+
+    pVirtualComPort->timestamp = get_tick();
+  }
+
+  if (_GetUSB_INT_STA() & USB_INT_STATE_SUSPENDF)
+  {
+    _ClrUSB_INT_STA(USB_INT_STATE_SUSPENDF);
+    /* TODO? Suspend callback */
+  }
+
+  if (_GetUSB_INT_STA() & USB_INT_STATE_RESUMF)
+  {
+    _ClrUSB_INT_STA(USB_INT_STATE_RESUMF);
+    /* TODO? Resume callback */
+  }
+
+  if(_GetUSB_INT_STA() & USB_INT_STATE_RSTF)
+  {
+    _ClrUSB_INT_STA(USB_INT_STATE_RSTF);
+    Device_Property.Reset();
+  }
+
+  if(_GetUSB_INT_STA() & USB_INT_STATE_EPINTF)
+  {
+    CTR_LP();
+  }
+}
+
+/* ------------------------------------------------------------------------ */
+
+/**
+ * USB Hardware initialization
+ */
+__attribute__((weak)) void
+USB_HardwareInit()
+{
+}
+
+/**
+ * Data received from host callback
+ */
+__attribute__((weak)) void
+VCOM_onDataReceivedFromHost(uint8_t *data, size_t size)
+{
+  (void) data;
+  (void) size;
+}
+
+/**
+ * Write data to ring buffer
+ */
+size_t
+VCOM_sendDataToHost(uint8_t *data, size_t size)
+{
+  return ring_buffer_write_bytes(&pVirtualComPort->rbToHost, data, size);
+}
+
+
+void
+VCOM_checkUplinkError()
+{
+  if (pVirtualComPort->State == ATTACHED ||
+      pVirtualComPort->State == ADDRESSED)
+  {
+    if ((pVirtualComPort->timestamp + 1500) < get_tick())
+    {
+      init_device();
+    }
+  }
+}
